@@ -1,0 +1,61 @@
+{
+    "name": "bedriox/nethernet",
+    "description": "A standalone NetherNet transport library for Bedriox and other PHP applications.",
+    "type": "library",
+    "license": "GPL-3.0-only",
+    "homepage": "https://bedriox.com",
+    "authors": [
+        {
+            "name": "Veno Ninja LLC",
+            "homepage": "https://bedriox.com"
+        }
+    ],
+    "support": {
+        "issues": "https://github.com/Bedriox/NetherNet/issues",
+        "source": "https://github.com/Bedriox/NetherNet"
+    },
+    "require": {
+        "php": "^8.4",
+        "php-64bit": "*",
+        "ext-hash": "*",
+        "ext-json": "*",
+        "ext-openssl": "*",
+        "ext-sockets": "*",
+        "ext-webrtc": "*"
+    },
+    "require-dev": {
+        "friendsofphp/php-cs-fixer": "^3.75",
+        "phpstan/phpstan": "^2.1",
+        "phpstan/phpstan-phpunit": "^2.0",
+        "phpstan/phpstan-strict-rules": "^2.0",
+        "phpunit/phpunit": "^11.5"
+    },
+    "autoload": {
+        "psr-4": {
+            "Bedriox\\NetherNet\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Bedriox\\NetherNet\\": "tests/"
+        }
+    },
+    "scripts": {
+        "check": [
+            "composer validate --strict",
+            "composer audit --locked",
+            "@test",
+            "@analyse",
+            "@style"
+        ],
+        "test": "phpunit",
+        "analyse": "phpstan analyse --no-progress --memory-limit=1G",
+        "style": "php-cs-fixer check --diff --verbose"
+    },
+    "config": {
+        "allow-plugins": false,
+        "sort-packages": true
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}

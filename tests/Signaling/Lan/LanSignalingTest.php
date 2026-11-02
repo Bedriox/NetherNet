@@ -1,0 +1,361 @@
+<?php
+
+/*
+ * Bedriox NetherNet - WebRTC transport for Minecraft: Bedrock Edition
+ * Copyright (C) 2026 Axolotl Team (original work)
+ * Copyright (C) 2026 Veno Ninja LLC (Bedriox modifications)
+ *
+ * Original work: https://github.com/axolotl-pm/NetherNet
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
+declare(strict_types=1);
+
+namespace Bedriox\NetherNet\Signaling\Lan;
+
+use const AF_INET;
+
+use Bedriox\NetherNet\FakeNegotiator;
+use Bedriox\NetherNet\Info\MutableServerInfoProvider;
+use Bedriox\NetherNet\Info\ServerInfo;
+use Bedriox\NetherNet\Info\ServerInfoCodec;
+use Bedriox\NetherNet\Info\ServerInfoProvider;
+use Bedriox\NetherNet\Negotiation\CandidateMode;
+use Bedriox\NetherNet\Negotiation\Negotiator;
+use Bedriox\NetherNet\Protocol\ErrorCode;
+use Bedriox\NetherNet\RecordingEventListener;
+use Bedriox\NetherNet\RecordingLogger;
+use Bedriox\NetherNet\Server\NetherNetServer;
+use Bedriox\NetherNet\Signaling\Lan\Packet\MessagePacket;
+use Bedriox\NetherNet\Signaling\Lan\Packet\Packet;
+use Bedriox\NetherNet\Signaling\Lan\Packet\PacketSerializer;
+use Bedriox\NetherNet\Signaling\Lan\Packet\RequestPacket;
+use Bedriox\NetherNet\Signaling\Lan\Packet\ResponsePacket;
+use Bedriox\NetherNet\Signaling\Signal;
+use Bedriox\NetherNet\Signaling\SignalType;
+use Bedriox\NetherNet\TestSignalingContext;
+use Bedriox\NetherNet\Transport\ConnectionBudgetConfiguration;
+use Bedriox\NetherNet\Utils\InternetAddress;
+
+use function microtime;
+
+use PHPUnit\Framework\TestCase;
+
+use const SOCK_DGRAM;
+
+use function socket_bind;
+use function socket_close;
+use function socket_create;
+
+use const SOCKET_EWOULDBLOCK;
+
+use function socket_last_error;
+use function socket_recvfrom;
+use function socket_sendto;
+use function socket_set_nonblock;
+
+use const SOL_UDP;
+
+use function strlen;
+use function usleep;
+
+/**
+ * Drives the transport over a real loopback socket.
+ *
+ * The parts worth testing here are the ones a unit test cannot reach: that the
+ * socket is set up so datagrams actually arrive, and that a peer is answered at
+ * the address its offer came from rather than one another peer can claim.
+ */
+final class LanSignalingTest extends TestCase
+{
+    private const HOST_NETWORK_ID = 4242;
+    private const PEER_NETWORK_ID = 9001;
+
+    private ?LanSignaling $signaling = null;
+    private ?\Socket $peer = null;
+    private int $hostPort = 0;
+
+    protected function setUp(): void
+    {
+        $peer = socket_create(AF_INET, SOCK_DGRAM, SOL_UDP);
+        self::assertNotFalse($peer);
+        self::assertTrue(socket_bind($peer, "127.0.0.1", 0));
+        socket_set_nonblock($peer);
+        $this->peer = $peer;
+    }
+
+    protected function tearDown(): void
+    {
+        $this->signaling?->shutdown();
+        if ($this->peer !== null) {
+            socket_close($this->peer);
+        }
+    }
+
+    private function peer(): \Socket
+    {
+        $peer = $this->peer;
+        self::assertNotNull($peer);
+
+        return $peer;
+    }
+
+    private function startHost(Negotiator $negotiator, ?ServerInfoProvider $infoProvider = null): void
+    {
+        $this->signaling = $this->createSignaling($infoProvider);
+        $this->signaling->start(TestSignalingContext::create($negotiator));
+        $this->hostPort = $this->signaling->getBoundAddress()->port;
+    }
+
+    private function startServer(Negotiator $negotiator): NetherNetServer
+    {
+        $server = new NetherNetServer($negotiator, new RecordingEventListener(), new ConnectionBudgetConfiguration(), new RecordingLogger());
+        $this->signaling = $this->createSignaling();
+        $server->addSignaling($this->signaling);
+        $server->start();
+        $this->hostPort = $this->signaling->getBoundAddress()->port;
+
+        return $server;
+    }
+
+    /**
+     * Port 0 keeps this off 7551, where a real client or another run of the suite may already be listening.
+     */
+    private function createSignaling(?ServerInfoProvider $infoProvider = null): LanSignaling
+    {
+        return new LanSignaling(
+            $infoProvider ?? new MutableServerInfoProvider(new ServerInfo(serverName: "test host", protocol: 2181, gameVersion: "1.26.50", levelName: "test world", playerCount: 3, maxPlayerCount: 10)),
+            self::HOST_NETWORK_ID,
+            new InternetAddress("127.0.0.1", 0, 4)
+        );
+    }
+
+    private function sendToHost(Packet $packet): void
+    {
+        $frame = PacketSerializer::encode($packet);
+        self::assertNotFalse(socket_sendto($this->peer(), $frame, \strlen($frame), 0, "127.0.0.1", $this->hostPort));
+    }
+
+    private function receive(): ?Packet
+    {
+        //one pass through the host, then look for what it sent back
+        for ($attempt = 0; $attempt < 50; ++$attempt) {
+            $this->signaling?->tick(microtime(true));
+
+            $buffer = "";
+            $from = "";
+            $fromPort = 0;
+            if (socket_recvfrom($this->peer(), $buffer, 65535, 0, $from, $fromPort) !== false) {
+                if (!\is_string($buffer)) {
+                    throw new \RuntimeException("socket_recvfrom() returned a non-string payload");
+                }
+                return PacketSerializer::decode($buffer);
+            }
+            if (socket_last_error($this->peer()) !== SOCKET_EWOULDBLOCK) {
+                break;
+            }
+
+            usleep(2000);
+        }
+
+        return null;
+    }
+
+    public function testRequestIsAnsweredWithTheHostAdvert(): void
+    {
+        $this->startHost(new FakeNegotiator("answer-sdp"));
+        $this->sendToHost(new RequestPacket(self::PEER_NETWORK_ID));
+
+        $received = $this->receive();
+        self::assertNotNull($received, "the host never answered the discovery request");
+
+        $packet = $received;
+        self::assertInstanceOf(ResponsePacket::class, $packet);
+        self::assertSame(self::HOST_NETWORK_ID, $packet->senderId);
+
+        $advert = ServerInfoCodec::decode($packet->applicationData);
+        self::assertSame("test host", $advert->serverName);
+        self::assertSame("test world", $advert->levelName);
+        self::assertSame(3, $advert->playerCount);
+    }
+
+    public function testDiscoveryRequestGoesUnansweredWhileThereIsNothingToAdvertise(): void
+    {
+        $this->startHost(new FakeNegotiator("answer-sdp"), new MutableServerInfoProvider());
+
+        $this->sendToHost(new RequestPacket(self::PEER_NETWORK_ID));
+
+        self::assertNull($this->receive());
+    }
+
+    /**
+     * A datagram this host broadcast itself comes straight back on the same socket.
+     * Acting on it would have the host answering its own request forever.
+     */
+    public function testOwnDatagramIsIgnored(): void
+    {
+        $this->startHost(new FakeNegotiator("answer-sdp"));
+        $this->sendToHost(new RequestPacket(self::HOST_NETWORK_ID));
+
+        self::assertNull($this->receive(), "the host answered a datagram carrying its own network id");
+    }
+
+    /** Traffic for another peer shares the broadcast domain and is not ours to answer. */
+    public function testMessageForAnotherRecipientIsIgnored(): void
+    {
+        $this->startHost(new FakeNegotiator("answer-sdp"));
+        $this->sendToHost(new MessagePacket(self::PEER_NETWORK_ID, 999999, "CONNECTREQUEST 1 offer-sdp"));
+
+        self::assertNull($this->receive());
+    }
+
+    public function testOfferIsAnsweredAndCandidatesFollow(): void
+    {
+        $negotiator = new FakeNegotiator("answer-sdp", ["candidate:1 1 udp 1 127.0.0.1 1 typ host"]);
+        $this->startHost($negotiator);
+
+        $this->sendToHost(new MessagePacket(self::PEER_NETWORK_ID, self::HOST_NETWORK_ID, "CONNECTREQUEST 77 offer-sdp"));
+
+        $received = $this->receive();
+        self::assertNotNull($received, "the host never answered the offer");
+        $packet = $received;
+        self::assertInstanceOf(MessagePacket::class, $packet);
+        self::assertSame(self::PEER_NETWORK_ID, $packet->recipientId);
+
+        $answer = Signal::parse($packet->data);
+        self::assertSame(SignalType::CONNECT_RESPONSE, $answer->type);
+        self::assertSame("77", $answer->connectionId);
+        self::assertSame("answer-sdp", $answer->data);
+        self::assertSame("offer-sdp", $negotiator->lastOffer);
+        //the peer's own id, as an unsigned decimal string
+        self::assertSame((string) self::PEER_NETWORK_ID, $negotiator->lastNetworkId);
+        self::assertSame(CandidateMode::TRICKLE, $negotiator->lastMode);
+
+        $received = $this->receive();
+        self::assertNotNull($received, "the host never trickled its candidate");
+        $candidatePacket = $received;
+        self::assertInstanceOf(MessagePacket::class, $candidatePacket);
+
+        $candidate = Signal::parse($candidatePacket->data);
+        self::assertSame(SignalType::CANDIDATE_ADD, $candidate->type);
+        self::assertSame("77", $candidate->connectionId);
+        self::assertSame("candidate:1 1 udp 1 127.0.0.1 1 typ host", $candidate->data);
+    }
+
+    public function testPeerCandidateReachesTheNegotiation(): void
+    {
+        $negotiator = new FakeNegotiator("answer-sdp");
+        $this->startHost($negotiator);
+
+        $this->sendToHost(new MessagePacket(self::PEER_NETWORK_ID, self::HOST_NETWORK_ID, "CONNECTREQUEST 77 offer-sdp"));
+        self::assertNotNull($this->receive());
+
+        $this->sendToHost(new MessagePacket(self::PEER_NETWORK_ID, self::HOST_NETWORK_ID, "CANDIDATEADD 77 candidate:9 1 udp 1 10.0.0.1 5 typ host"));
+        $this->receive();
+
+        self::assertSame(["candidate:9 1 udp 1 10.0.0.1 5 typ host"], $negotiator->negotiation?->remoteCandidates);
+    }
+
+    /** Vanilla sends these as filler, and there is nothing to do with one. */
+    public function testPingMessageIsIgnored(): void
+    {
+        $this->startHost(new FakeNegotiator("answer-sdp"));
+        $this->sendToHost(new MessagePacket(self::PEER_NETWORK_ID, self::HOST_NETWORK_ID, "Ping"));
+
+        self::assertNull($this->receive());
+    }
+
+    /**
+     * A peer that reports an error already knows the connection is dead. Answering with an error of our own
+     * tells it nothing, and two hosts doing so to each other would never stop.
+     */
+    public function testErrorReportedByThePeerIsNotEchoedBack(): void
+    {
+        $negotiator = new FakeNegotiator(null);
+        $this->startHost($negotiator);
+
+        $this->sendToHost(new MessagePacket(self::PEER_NETWORK_ID, self::HOST_NETWORK_ID, "CONNECTREQUEST 5 offer-sdp"));
+        self::assertNull($this->receive());
+        $this->sendToHost(new MessagePacket(self::PEER_NETWORK_ID, self::HOST_NETWORK_ID, "CONNECTERROR 5 2"));
+
+        self::assertNull($this->receive(), "the host answered an error with an error");
+        self::assertTrue($negotiator->negotiation?->isFailed());
+    }
+
+    public function testFailedNegotiationIsReportedToThePeer(): void
+    {
+        //failed from the moment it is created, since the offer has not even been
+        //read by the time this test can reach in and fail one by hand
+        $negotiator = new FakeNegotiator(null, failWith: ErrorCode::IDENTITY_NOT_ALLOWED);
+        $this->startHost($negotiator);
+
+        $this->sendToHost(new MessagePacket(self::PEER_NETWORK_ID, self::HOST_NETWORK_ID, "CONNECTREQUEST 5 offer-sdp"));
+
+        $received = $this->receive();
+        self::assertNotNull($received);
+        $packet = $received;
+        self::assertInstanceOf(MessagePacket::class, $packet);
+
+        $signal = Signal::parse($packet->data);
+        self::assertSame(SignalType::CONNECT_ERROR, $signal->type);
+        self::assertSame((string) ErrorCode::IDENTITY_NOT_ALLOWED->value, $signal->data);
+    }
+
+    /**
+     * Nothing stops a LAN peer from putting someone else's NetworkID in a datagram,
+     * so the answer has to go back to where the offer came from and nowhere else.
+     */
+    public function testSpoofedSenderCannotRedirectTheAnswer(): void
+    {
+        $this->startHost(new FakeNegotiator("answer-sdp"));
+
+        $impostor = socket_create(AF_INET, SOCK_DGRAM, SOL_UDP);
+        self::assertNotFalse($impostor);
+        self::assertTrue(socket_bind($impostor, "127.0.0.1", 0));
+        socket_set_nonblock($impostor);
+
+        try {
+            $this->sendToHost(new MessagePacket(self::PEER_NETWORK_ID, self::HOST_NETWORK_ID, "CONNECTREQUEST 77 offer-sdp"));
+
+            //claims the peer's id from a different socket, before the host has answered
+            $spoofed = PacketSerializer::encode(new MessagePacket(self::PEER_NETWORK_ID, self::HOST_NETWORK_ID, "Ping"));
+            self::assertNotFalse(socket_sendto($impostor, $spoofed, \strlen($spoofed), 0, "127.0.0.1", $this->hostPort));
+
+            $received = $this->receive();
+            self::assertNotNull($received, "the host never answered the offer");
+            $packet = $received;
+            self::assertInstanceOf(MessagePacket::class, $packet);
+            self::assertSame(SignalType::CONNECT_RESPONSE, Signal::parse($packet->data)->type);
+
+            $buffer = "";
+            $from = "";
+            $fromPort = 0;
+            self::assertFalse(
+                socket_recvfrom($impostor, $buffer, 65535, 0, $from, $fromPort),
+                "the answer was redirected to the peer that claimed the network id"
+            );
+        } finally {
+            socket_close($impostor);
+        }
+    }
+
+    /**
+     * A block is placed on the server, but it is the transport that sees the datagrams, so this
+     * is what shows the two are connected. Nothing a blocked peer sends is looked at, not even
+     * a discovery request.
+     */
+    public function testBlockPlacedOnTheServerReachesTheTransport(): void
+    {
+        $server = $this->startServer(new FakeNegotiator("answer-sdp"));
+
+        $server->blockAddress("127.0.0.1", -1);
+        $this->sendToHost(new RequestPacket(self::PEER_NETWORK_ID));
+        self::assertNull($this->receive(), "the host answered a blocked address");
+
+        $server->unblockAddress("127.0.0.1");
+        $this->sendToHost(new RequestPacket(self::PEER_NETWORK_ID));
+        self::assertNotNull($this->receive(), "the host stayed silent after the block was lifted");
+
+        $server->shutdown();
+    }
+}

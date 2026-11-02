@@ -1,0 +1,73 @@
+<?php
+
+/*
+ * Bedriox NetherNet - WebRTC transport for Minecraft: Bedrock Edition
+ * Copyright (C) 2026 Axolotl Team (original work)
+ * Copyright (C) 2026 Veno Ninja LLC (Bedriox modifications)
+ *
+ * Original work: https://github.com/axolotl-pm/NetherNet
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
+declare(strict_types=1);
+
+namespace Bedriox\NetherNet\Negotiation;
+
+use PHPUnit\Framework\TestCase;
+
+final class IceCandidateFormatterTest extends TestCase
+{
+    private const LAN_HOST = "1 1 UDP 2114977791 192.168.45.45 38922 typ host";
+    private const DOCKER_HOST = "2 1 UDP 2114977535 172.17.0.1 38922 typ host";
+    private const IPV6_HOST = "3 1 UDP 2116025599 fd7a:115c:a1e0::1 38922 typ host";
+
+    /**
+     * Gathers candidates unreachable from the public internet; unadvertised candidates are dropped to avoid
+     * unnecessary connectivity checks.
+     */
+    public function testCandidatesOnOtherAddressesAreDropped(): void
+    {
+        $advertised = IceCandidateFormatter::advertise([self::LAN_HOST, self::DOCKER_HOST, self::IPV6_HOST], ["192.168.45.45"]);
+
+        self::assertSame([self::LAN_HOST], $advertised);
+    }
+
+    /**
+     * Behind a port-forwarding NAT, the external address must be announced using the port from the gathered UDP
+     * host candidate.
+     */
+    public function testForeignAddressIsAnnouncedAsServerReflexiveOnTheGatheredPort(): void
+    {
+        $advertised = IceCandidateFormatter::advertise([self::LAN_HOST, self::DOCKER_HOST], ["203.0.113.10"]);
+
+        self::assertSame(["80000000 1 udp " . ((100 << 24) + (65535 << 8) + 255) . " 203.0.113.10 38922 typ srflx raddr 0.0.0.0 rport 0"], $advertised);
+    }
+
+    public function testIpv6AddressMatchesRegardlessOfNotation(): void
+    {
+        self::assertSame([self::IPV6_HOST], IceCandidateFormatter::advertise([self::IPV6_HOST], ["[FD7A:115C:A1E0:0:0:0:0:1]"]));
+    }
+
+    public function testIpv6ServerReflexiveUsesIpv6UnspecifiedRelatedAddress(): void
+    {
+        $advertised = IceCandidateFormatter::advertise([self::LAN_HOST, self::IPV6_HOST], ["2001:db8::1"]);
+
+        self::assertSame(["80000000 1 udp " . ((100 << 24) + (65535 << 8) + 255) . " 2001:db8::1 38922 typ srflx raddr :: rport 0"], $advertised);
+    }
+
+    public function testFormattedCandidateKeepsTheRelatedAddressItWasGatheredWith(): void
+    {
+        $formatted = IceCandidateFormatter::format("candidate:1 1 UDP 1686052607 2001:db8::1 38922 typ srflx raddr fd7a:115c:a1e0::1 rport 38922", "ufrag", 0);
+
+        self::assertStringContainsString("2001:db8::1 38922 typ srflx raddr fd7a:115c:a1e0::1 rport 38922 generation 0 ", $formatted);
+    }
+
+    /**
+     * Without a UDP host candidate, no port is available for external addresses, so no synthetic candidates are generated.
+     */
+    public function testForeignAddressNeedsAHostCandidateForItsPort(): void
+    {
+        self::assertSame([], IceCandidateFormatter::advertise([], ["203.0.113.10"]));
+        self::assertSame([], IceCandidateFormatter::advertise(["1 1 TCP 2105458943 192.168.45.45 9 typ host tcptype active"], ["203.0.113.10"]));
+    }
+}

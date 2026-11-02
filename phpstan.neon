@@ -1,0 +1,26 @@
+includes:
+    - vendor/phpstan/phpstan-phpunit/extension.neon
+    - vendor/phpstan/phpstan-phpunit/rules.neon
+    - vendor/phpstan/phpstan-strict-rules/rules.neon
+
+parameters:
+    level: max
+    treatPhpDocTypesAsCertain: false
+    rememberPossiblyImpureFunctionValues: false
+    scanDirectories:
+        - tools/phpstan/webrtc
+    stubFiles:
+        - tools/phpstan/webrtc/constants.stub.php
+        - tools/phpstan/webrtc/DataChannel.stub.php
+        - tools/phpstan/webrtc/DataChannelOptions.stub.php
+        - tools/phpstan/webrtc/Enums.stub.php
+        - tools/phpstan/webrtc/functions.stub.php
+        - tools/phpstan/webrtc/IceCandidate.stub.php
+        - tools/phpstan/webrtc/IceServer.stub.php
+        - tools/phpstan/webrtc/PeerConnection.stub.php
+        - tools/phpstan/webrtc/PeerConnectionOptions.stub.php
+        - tools/phpstan/webrtc/WebRtcException.stub.php
+    paths:
+        - src
+        - tests
+    tmpDir: build/phpstan

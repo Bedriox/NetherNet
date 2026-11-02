@@ -1,0 +1,28 @@
+<?php
+
+/*
+ * Bedriox NetherNet - WebRTC transport for Minecraft: Bedrock Edition
+ * Copyright (C) 2026 Axolotl Team (original work)
+ * Copyright (C) 2026 Veno Ninja LLC (Bedriox modifications)
+ *
+ * Original work: https://github.com/axolotl-pm/NetherNet
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
+declare(strict_types=1);
+
+namespace Bedriox\NetherNet\Identity;
+
+final class PeerIdentity
+{
+    /**
+     * @param PublicKey    $publicKey      The peer's verified public key, bound to this connection's DTLS fingerprint.
+     * @param string       $providerDomain Identity provider domain claimed in the assertion (unverified, for informational/display purposes only).
+     * @param JsonWebToken $token          The token the peer presented. Its claims are only as trustworthy as the {@link TokenVerifier} that accepted it.
+     */
+    public function __construct(
+        public readonly PublicKey $publicKey,
+        public readonly string $providerDomain,
+        public readonly JsonWebToken $token
+    ) {}
+}

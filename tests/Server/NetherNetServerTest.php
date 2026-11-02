@@ -1,0 +1,440 @@
+<?php
+
+/*
+ * Bedriox NetherNet - WebRTC transport for Minecraft: Bedrock Edition
+ * Copyright (C) 2026 Axolotl Team (original work)
+ * Copyright (C) 2026 Veno Ninja LLC (Bedriox modifications)
+ *
+ * Original work: https://github.com/axolotl-pm/NetherNet
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
+declare(strict_types=1);
+
+namespace Bedriox\NetherNet\Server;
+
+use Bedriox\NetherNet\FakeMessageChannel;
+use Bedriox\NetherNet\FakeNegotiator;
+use Bedriox\NetherNet\FakePeerTransport;
+use Bedriox\NetherNet\FakeSignaling;
+use Bedriox\NetherNet\Negotiation\EstablishedPeer;
+use Bedriox\NetherNet\Protocol\DisconnectReason;
+use Bedriox\NetherNet\Protocol\Reliability;
+use Bedriox\NetherNet\RecordingEventListener;
+use Bedriox\NetherNet\RecordingLogger;
+use Bedriox\NetherNet\Session\Session;
+use Bedriox\NetherNet\Signaling\SignalingException;
+use Bedriox\NetherNet\Transport\ChannelPair;
+use Bedriox\NetherNet\Transport\ConnectionBudgetConfiguration;
+use Bedriox\NetherNet\Transport\TransportState;
+use Bedriox\NetherNet\Utils\InternetAddress;
+use PHPUnit\Framework\TestCase;
+
+use function str_repeat;
+
+final class NetherNetServerTest extends TestCase
+{
+    private FakeNegotiator $negotiator;
+    private RecordingEventListener $listener;
+    private NetherNetServer $server;
+    private RecordingLogger $logger;
+
+    protected function setUp(): void
+    {
+        $this->logger = new RecordingLogger();
+        $this->negotiator = new FakeNegotiator();
+        $this->listener = new RecordingEventListener();
+        $this->server = new NetherNetServer(
+            $this->negotiator,
+            $this->listener,
+            new ConnectionBudgetConfiguration(),
+            $this->logger
+        );
+    }
+
+    /**
+     * @phpstan-return array{EstablishedPeer, FakePeerTransport, FakeMessageChannel}
+     */
+    private static function peer(string $ip = "192.0.2.10", int $version = 4, ?string $clientAddress = null): array
+    {
+        $transport = new FakePeerTransport();
+        $transport->state = TransportState::CONNECTED;
+        $reliable = new FakeMessageChannel(Reliability::RELIABLE);
+
+        return [
+            new EstablishedPeer($transport, new ChannelPair($reliable, new FakeMessageChannel(Reliability::UNRELIABLE)), "1234", new InternetAddress($ip, 5000, $version), $clientAddress, null),
+            $transport,
+            $reliable,
+        ];
+    }
+
+    public function testStartHandsEveryTransportTheServersCollaborators(): void
+    {
+        $this->server->addSignaling($first = new FakeSignaling());
+        $this->server->addSignaling($second = new FakeSignaling());
+
+        self::assertSame(ServerState::CREATED, $this->server->getState());
+        $this->server->start();
+
+        self::assertTrue($this->server->isRunning());
+        self::assertSame($this->negotiator, $first->context?->negotiator);
+        self::assertSame($first->context, $second->context);
+    }
+
+    /**
+     * A server that could not start everything is not half running: what did start is stopped again, and the
+     * server says so instead of claiming to be up.
+     */
+    public function testFailedStartLeavesTheServerStopped(): void
+    {
+        $this->server->addSignaling($started = new FakeSignaling());
+        $this->server->addSignaling(new FakeSignaling(failToStart: true));
+
+        try {
+            $this->server->start();
+            self::fail("the server started without one of its transports");
+        } catch (SignalingException) {
+            self::assertFalse($this->server->isRunning());
+            self::assertSame(ServerState::STOPPED, $this->server->getState());
+            self::assertSame(1, $started->shutdowns);
+            self::assertTrue($this->negotiator->shutDown);
+        }
+    }
+
+    public function testOptionalTransportFailingToStartDoesNotPreventStart(): void
+    {
+        $this->server->addSignaling($required = new FakeSignaling());
+        $this->server->addSignaling($optional = new FakeSignaling(failToStart: true), optional: true);
+
+        $this->server->start();
+        $this->server->tick(1.0);
+
+        self::assertTrue($this->server->isRunning());
+        self::assertSame([1.0], $required->ticks);
+        self::assertSame([], $optional->ticks);
+        self::assertSame(1, $optional->shutdowns);
+        self::assertContains("warning: Unable to start fake signaling: start refused by the test", $this->logger->messages);
+        self::assertContains("info: Started fake signaling", $this->logger->messages);
+
+        $this->server->shutdown();
+        self::assertSame(1, $optional->shutdowns);
+        self::assertSame(1, $required->shutdowns);
+    }
+
+    public function testOptionalTransportThatFailedIsNotShutDownAgainWhenARequiredOneFails(): void
+    {
+        $this->server->addSignaling($failed = new FakeSignaling(failToStart: true), optional: true);
+        $this->server->addSignaling(new FakeSignaling(failToStart: true));
+
+        try {
+            $this->server->start();
+            self::fail("the server started without a required transport");
+        } catch (SignalingException) {
+            self::assertSame(1, $failed->shutdowns);
+        }
+    }
+
+    public function testStartFailsWhenEveryTransportWasOptionalAndFailed(): void
+    {
+        $this->server->addSignaling(new FakeSignaling(failToStart: true), optional: true);
+
+        $this->expectException(SignalingException::class);
+        try {
+            $this->server->start();
+        } finally {
+            self::assertSame(ServerState::STOPPED, $this->server->getState());
+        }
+    }
+
+    public function testServerWithoutTransportsStarts(): void
+    {
+        $this->server->start();
+
+        self::assertTrue($this->server->isRunning());
+    }
+
+    public function testStartingTwiceIsRefused(): void
+    {
+        $this->server->start();
+
+        $this->expectException(\LogicException::class);
+        $this->server->start();
+    }
+
+    public function testTransportsCannotBeAddedOnceStarted(): void
+    {
+        $this->server->start();
+
+        $this->expectException(\LogicException::class);
+        $this->server->addSignaling(new FakeSignaling());
+    }
+
+    public function testNothingIsTickedBeforeTheServerStarts(): void
+    {
+        $this->server->addSignaling($signaling = new FakeSignaling());
+
+        $this->server->tick(1.0);
+
+        self::assertSame([], $signaling->ticks);
+        self::assertSame([], $this->negotiator->ticks);
+    }
+
+    public function testEverythingInATickSeesTheSameTime(): void
+    {
+        $this->server->addSignaling($signaling = new FakeSignaling());
+        $this->server->start();
+
+        $this->server->tick(42.5);
+
+        self::assertSame([42.5], $signaling->ticks);
+        self::assertSame([42.5], $this->negotiator->ticks);
+    }
+
+    /**
+     * The offer may have arrived through a transport that never saw the peer's real address, or before the
+     * block was placed; the connection itself is the last place to catch it.
+     */
+    public function testPeerConnectingFromABlockedAddressIsClosedInstead(): void
+    {
+        $this->server->start();
+        $this->server->blockAddress("192.0.2.10", -1);
+        [$peer, $transport] = self::peer();
+        $this->negotiator->established[] = $peer;
+
+        $this->server->tick(1.0);
+
+        self::assertSame([], $this->listener->opened);
+        self::assertTrue($transport->closed);
+        $snapshot = $this->server->getSecuritySnapshot();
+        self::assertSame(1, $snapshot->activeAddressBlocks);
+        self::assertSame(1, $snapshot->blockedPeerRejections);
+    }
+
+    public function testSecuritySnapshotReportsSessionCapacityRefusals(): void
+    {
+        $server = new NetherNetServer(
+            $this->negotiator,
+            $this->listener,
+            new ConnectionBudgetConfiguration(),
+            $this->logger,
+            maxSessions: 1,
+        );
+        $server->start();
+        [$first] = self::peer();
+        [$second, $secondTransport] = self::peer('192.0.2.11');
+        $this->negotiator->established = [$first, $second];
+
+        $server->tick(1.0);
+
+        $snapshot = $server->getSecuritySnapshot();
+        self::assertSame(1, $snapshot->activeSessions);
+        self::assertSame(1, $snapshot->maximumSessions);
+        self::assertSame(1, $snapshot->sessionLimitRejections);
+        self::assertTrue($secondTransport->closed);
+    }
+
+    public function testBlockingAnAddressDisconnectsItsSessions(): void
+    {
+        $this->server->start();
+        [$blocked] = self::peer("2001:db8::1", 6);
+        [$other] = self::peer("192.0.2.99");
+        $this->negotiator->established = [$blocked, $other];
+        $this->server->tick(1.0);
+        $blockedId = $this->listener->opened[0][0];
+
+        //a different spelling of the same address
+        $this->server->blockAddress("2001:db8:0:0:0:0:0:1");
+        $this->server->tick(1.1);
+
+        self::assertSame([[$blockedId, DisconnectReason::ADDRESS_BLOCKED]], $this->listener->closed);
+    }
+
+    public function testBlockingAnAddressDisconnectsTheSessionsSignaledFromIt(): void
+    {
+        $this->server->start();
+        [$blocked] = self::peer(clientAddress: "203.0.113.7");
+        [$other] = self::peer(clientAddress: "203.0.113.8");
+        $this->negotiator->established = [$blocked, $other];
+        $this->server->tick(1.0);
+        $blockedId = $this->listener->opened[0][0];
+
+        $this->server->blockAddress("203.0.113.7");
+        $this->server->tick(1.1);
+
+        self::assertSame([[$blockedId, DisconnectReason::ADDRESS_BLOCKED]], $this->listener->closed);
+    }
+
+    public function testGracefulShutdownStopsAcceptingAtOnceAndLetsSessionsFlush(): void
+    {
+        $this->server->addSignaling($signaling = new FakeSignaling());
+        $this->server->start();
+        [$peer, $transport, $reliable] = self::peer();
+        $this->negotiator->established[] = $peer;
+        $this->server->tick(1.0);
+        $sessionId = $this->listener->opened[0][0];
+        $reliable->buffered = 100;
+
+        $this->server->initiateShutdown();
+
+        self::assertSame(ServerState::STOPPING, $this->server->getState());
+        self::assertFalse($this->server->isRunning());
+        self::assertSame(1, $signaling->shutdowns);
+        self::assertTrue($this->negotiator->shutDown);
+        self::assertFalse($transport->closed, "the session was cut off with data still queued");
+
+        $this->server->tick(1.1);
+        self::assertSame(ServerState::STOPPING, $this->server->getState());
+        self::assertSame([1.0], $signaling->ticks, "a transport was ticked after it had been shut down");
+
+        $reliable->buffered = 0;
+        $this->server->tick(1.2);
+        self::assertSame(ServerState::STOPPING, $this->server->getState(), "the server stopped before the peer had a chance to read what was flushed");
+
+        $reliable->closed = true;
+        $this->server->tick(1.3);
+
+        self::assertSame([[$sessionId, DisconnectReason::SERVER_SHUTDOWN]], $this->listener->closed);
+        self::assertSame(ServerState::STOPPED, $this->server->getState());
+        self::assertSame(1, $signaling->shutdowns, "the transport was shut down a second time");
+    }
+
+    /**
+     * A host acts on what it last heard, and a session may have ended since; that is not the host's error.
+     */
+    public function testCommandsForASessionThatIsGoneAreIgnored(): void
+    {
+        $this->server->start();
+
+        $this->server->sendPacket(99, "hello");
+        $this->server->closeSession(99);
+
+        self::assertSame([], $this->listener->closed);
+    }
+
+    public function testSendTheTransportRefusesEndsTheSessionInsteadOfThrowing(): void
+    {
+        $this->server->start();
+        [$peer, , $reliable] = self::peer();
+        $this->negotiator->established[] = $peer;
+        $this->server->tick(1.0);
+        $sessionId = $this->listener->opened[0][0];
+        $reliable->failSends = true;
+
+        $this->server->sendPacket($sessionId, "hello");
+        $this->server->tick(1.1);
+
+        self::assertSame([[$sessionId, DisconnectReason::SEND_FAILED]], $this->listener->closed);
+    }
+
+    public function testReliablePacketTooLargeToSendClosesTheSession(): void
+    {
+        $this->server->start();
+        [$peer, , $reliable] = self::peer();
+        $reliable->maxMessageSize = 3;
+        $this->negotiator->established[] = $peer;
+        $this->server->tick(1.0);
+        $sessionId = $this->listener->opened[0][0];
+
+        $this->server->sendPacket($sessionId, str_repeat("x", 1024));
+        $this->server->tick(1.1);
+
+        self::assertSame([], $reliable->sent);
+        self::assertSame([[$sessionId, DisconnectReason::SEND_FAILED]], $this->listener->closed);
+    }
+
+    public function testUnreliablePacketTooLargeToSendIsOnlyLost(): void
+    {
+        $this->server->start();
+        [$peer, , $reliable] = self::peer();
+        $reliable->maxMessageSize = 3;
+        $this->negotiator->established[] = $peer;
+        $this->server->tick(1.0);
+        $sessionId = $this->listener->opened[0][0];
+
+        $this->server->sendPacket($sessionId, "too long for one segment", Reliability::UNRELIABLE);
+        $this->server->tick(1.1);
+
+        self::assertSame([], $this->listener->closed);
+    }
+
+    public function testListenerCanTurnASessionAwayAsItOpens(): void
+    {
+        $this->server->start();
+        [$peer, $transport, $reliable] = self::peer();
+        $reliable->incoming = ["\x00hello"];
+        $this->negotiator->established[] = $peer;
+        $this->listener->onOpen = fn(int $sessionId) => $this->server->closeSession($sessionId, DisconnectReason::REJECTED_BY_HOST);
+
+        $this->server->tick(1.0);
+        $this->server->tick(1.0 + Session::DISCONNECT_TIMEOUT);
+
+        self::assertCount(1, $this->listener->opened);
+        self::assertSame([[$this->listener->opened[0][0], DisconnectReason::REJECTED_BY_HOST]], $this->listener->closed);
+        self::assertSame([], $this->listener->packets);
+        self::assertTrue($transport->closed);
+    }
+
+    /**
+     * A listener that throws ends the tick, and the peers it had not been shown yet would otherwise stay
+     * connected with nothing ever reading from them.
+     */
+    public function testPeersNotYetOpenedAreClosedWhenTheListenerThrows(): void
+    {
+        $this->server->start();
+        [$first, $firstTransport] = self::peer();
+        [$second, $secondTransport] = self::peer("192.0.2.11");
+        $this->negotiator->established = [$first, $second];
+        $this->listener->failOpenWith = new \RuntimeException("host refused the session");
+
+        try {
+            $this->server->tick(1.0);
+            self::fail("the listener's failure was swallowed");
+        } catch (\RuntimeException) {
+            self::assertTrue($firstTransport->closed);
+            self::assertTrue($secondTransport->closed);
+        }
+    }
+
+    public function testGracefulShutdownWithNoSessionsStopsOnTheNextTick(): void
+    {
+        $this->server->start();
+
+        $this->server->initiateShutdown();
+        $this->server->tick(1.0);
+
+        self::assertSame(ServerState::STOPPED, $this->server->getState());
+    }
+
+    public function testImmediateShutdownClosesSessionsWithoutWaiting(): void
+    {
+        $this->server->addSignaling($signaling = new FakeSignaling());
+        $this->server->start();
+        [$peer, $transport, $reliable] = self::peer();
+        $this->negotiator->established[] = $peer;
+        $this->server->tick(1.0);
+        $reliable->buffered = 100;
+
+        $this->server->shutdown();
+        $this->server->shutdown();
+
+        self::assertSame(ServerState::STOPPED, $this->server->getState());
+        self::assertTrue($transport->closed);
+        self::assertSame(DisconnectReason::SERVER_SHUTDOWN, $this->listener->closed[0][1] ?? null);
+        self::assertSame(1, $signaling->shutdowns);
+    }
+
+    public function testShutdownCanCutAGracefulStopShort(): void
+    {
+        $this->server->start();
+        [$peer, $transport, $reliable] = self::peer();
+        $this->negotiator->established[] = $peer;
+        $this->server->tick(1.0);
+        $reliable->buffered = 100;
+
+        $this->server->initiateShutdown();
+        $this->server->shutdown();
+
+        self::assertSame(ServerState::STOPPED, $this->server->getState());
+        self::assertTrue($transport->closed);
+    }
+}
