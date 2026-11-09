@@ -28,6 +28,7 @@ final readonly class ClientConfiguration
         public int $idleTimeoutMilliseconds = 30_000,
         public int $maximumHttpResponseBytes = 262_144,
         public ConnectionBudgetConfiguration $budget = new ConnectionBudgetConfiguration(),
+        public ?string $forwardedForAddress = null,
     ) {
         if (filter_var($targetAddress, FILTER_VALIDATE_IP) === false
             || filter_var($bindAddress, FILTER_VALIDATE_IP) === false) {
@@ -42,6 +43,9 @@ final readonly class ClientConfiguration
             || $handshakeTimeoutMilliseconds < 1 || $idleTimeoutMilliseconds < 1
             || $maximumHttpResponseBytes < 1_024 || $maximumHttpResponseBytes > 1_048_576) {
             throw new \InvalidArgumentException('NetherNet client limits are invalid.');
+        }
+        if ($forwardedForAddress !== null && filter_var($forwardedForAddress, FILTER_VALIDATE_IP) === false) {
+            throw new \InvalidArgumentException('Forwarded client address must be an IP address when present.');
         }
     }
 }

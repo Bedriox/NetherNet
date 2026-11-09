@@ -228,8 +228,12 @@ final class NetherNetClient
             $offer->validate();
             $identity = new SelfSignedIdentityProvider(ServerIdentity::generate());
             $body = $offer->withIdentity($identity->issue($offer->getFingerprint())->encode())->toString();
+            $forwardedFor = $this->config->forwardedForAddress === null
+                ? ''
+                : "X-Forwarded-For: {$this->config->forwardedForAddress}\r\n";
             $this->signalingRequest = "POST /v1/join/{$this->config->networkId} HTTP/1.1\r\n"
                 . "Host: {$this->config->targetAddress}:{$this->config->targetPort}\r\n"
+                . $forwardedFor
                 . "Content-Type: application/sdp\r\n"
                 . 'Content-Length: ' . \strlen($body) . "\r\n"
                 . "Connection: close\r\n\r\n"
